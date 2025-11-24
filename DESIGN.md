@@ -199,3 +199,117 @@ Este documento define la arquitectura interna propuesta para los módulos `core.
 
 - Entrada: resultados agregados de `core.cycle` (curvas y trazas), señales de `core.gasdynamics` y audio/espectros de `core.acoustics`.
 - Salida: archivos CSV/JSON y gráficos opcionales; provee insumos para `core.validation` y para reporting por CLI/API.
+
+## app.cli
+
+### Comandos conceptuales y parámetros clave
+
+- **sim-0d**
+  - Parámetros: `--config path` (JSON/YAML), `--rpm value` o `--rpm-map path`, `--output dir`, `--angle-step deg`, `--fast-fill-model name`.
+  - Resultados: archivos CSV/JSON con par/potencia/VE/IMEP/BMEP, metadatos de simulación; opcionalmente gráficas y trazas de presión por cilindro.
+
+- **sim-1d**
+  - Parámetros: `--config path`, `--rpm value|map`, `--output dir`, `--cfl-safety factor`, `--angle-step deg`, `--max-cycles n`.
+  - Resultados: mismos que `sim-0d` pero incluyendo trazas de red 1D (presión/caudal en nodos), historial de convergencia y datos para acústica.
+
+- **rpm-sweep**
+  - Parámetros: `--config path`, `--rpm-grid start:end:step` o lista, `--mode 0d|1d`, `--output dir`.
+  - Resultados: curvas rpm–par–potencia–VE en CSV/JSON; gráficos opcionales.
+
+- **sound**
+  - Parámetros: `--config path`, `--rpm value`, `--mode 0d|1d`, `--audio-fs hz`, `--output dir`.
+  - Resultados: archivo `.wav` y espectro en CSV/JSON generados desde la señal de escape.
+
+- **explore**
+  - Parámetros: `--config path`, `--exploration-config path`, `--mode 0d|1d`, `--rpm value|grid`, `--output dir`, `--max-samples n`.
+  - Resultados: tabla de combinaciones exploradas con métricas clave; mejores configuraciones exportables.
+
+- **optimize**
+  - Parámetros: `--config path`, `--optimization-config path`, `--rpm-range min max`, `--mode 0d|1d`, `--output dir`, `--method grid|random|hill`.
+  - Resultados: configuración óptima y top N, curvas comparativas vs configuración base, tabla con T_mean, P_mean y objetivo J.
+
+### Relaciones
+
+- Cada comando invoca `io.config` para cargar/validar el setup, llama a `core.cycle` (modo 0D o 1D) y utiliza `io.results`/`io.audio` para persistir salidas.
+- `explore` y `optimize` orquestan `core.exploration` y `core.optimization`, respectivamente, y reutilizan los resultados para construir reportes.
+
+## app.api
+
+### Funciones de alto nivel
+
+- `run_simulation(config_obj, mode="0d"|"1d", rpm=value|schedule) → SimulationResult`
+  - Entrada: estructura de configuración validada (`SimulationSetup`), selección de modo y rpm o mapa de rpm.
+  - Salida: objeto `SimulationResult` con par/potencia/VE/IMEP/BMEP, trazas por cilindro y de red según el modo.
+
+- `run_rpm_sweep(config_obj, rpm_grid, mode="0d"|"1d") → SweepResult`
+  - Entrada: setup más malla de rpm.
+  - Salida: curvas rpm–par–potencia–VE y metadatos de cada punto.
+
+- `generate_exhaust_sound(sim_result, audio_settings) → AudioBundle`
+  - Entrada: `SimulationResult` que incluya presión en cola de escape; ajustes de muestreo/normalización.
+  - Salida: señal de audio remuestreada, espectro y metadatos listos para exportar.
+
+- `run_exploration(config_obj, exploration_settings) → ExplorationResult`
+  - Entrada: setup base más definición de parámetros a barrer y muestreo.
+  - Salida: tabla de combinaciones con métricas agregadas y mejores configuraciones.
+
+- `run_optimization(config_obj, optimization_settings) → OptimizationResult`
+  - Entrada: setup base más rangos/cotas de parámetros y pesos de objetivo.
+  - Salida: configuración óptima p*, top N y comparación con base.
+
+### Relaciones
+
+- Las funciones instancian `core.cycle.EngineSimulator` con objetos de `io.config`, delegan en `core.exploration` o `core.optimization` cuando aplica, y usan `core.acoustics` para sonido.
+- `SimulationResult`, `SweepResult`, `ExplorationResult` y `OptimizationResult` son contenedores serializables que `io.results` puede escribir.
+
+## core.exploration
+
+### Configuración de exploración
+
+- **ExplorationParameter**: nombre del parámetro (ej. `intake.primary_length`), mínimo, máximo, pasos o distribución (grid, latin-hypercube, aleatorio), tipo (geométrico, lineal), flag de fijación.
+- **ExplorationSettings**: lista de `ExplorationParameter`, tamaño máximo de muestras, modo de simulación (0D/1D), rpm única o malla, criterios de ordenación (por T_mean, P_mean, VE), filtros postproceso.
+
+### Motor de exploración
+
+- **Explorer**
+  - Atributos: referencia al setup base, generador de muestras (grid builder o sampler), `EngineSimulator` o wrapper de simulación, buffers de resultados.
+  - Métodos públicos: `generate_samples(settings)`, `run_all(settings)`, `collect_metrics(rpm_range=None)`, `top_n(n, metric)`, `export_table()`.
+
+### Flujo de datos
+
+- Entrada: setup base desde `io.config`, definición de parámetros y rangos desde archivo de exploración.
+- Proceso: `generate_samples` crea combinaciones; cada combinación genera un setup modificado (ajustando geometría, levas o calibración) y ejecuta `core.cycle` en modo elegido; métricas (T_mean, P_mean, VE) se calculan sobre rpm especificada o rango.
+- Salida: tabla ordenable/filtrable, exportable vía `io.results`; top N se usa como semillas para `core.optimization`.
+
+## core.optimization
+
+### Configuración de optimización
+
+- **OptimizationParameter**: nombre, cota_inferior, cota_superior, resolución/paso, fijo (bool), tipo de ajuste (geométrico/lineal), sensibilidad esperada.
+- **OptimizationSettings**: rango rpm (`rpm_min`, `rpm_max`), pesos `w_T`, `w_P`, tamaño de población/muestras, método (`grid`, `random`, `hill`), límites de iteraciones, configuración inicial opcional.
+
+### Motor de optimización
+
+- **Optimizer**
+  - Atributos: setup base, método seleccionado, generador de vecinos (para `hill`), `EngineSimulator` o wrapper, historial de evaluaciones.
+  - Métodos públicos: `evaluate(p_vector) → (T_mean, P_mean, J)`, `run(settings) → OptimizationResult`, `neighbor(p_current)` (para hill-climbing), `sample_random()` (para random search), `grid_iter()` (para grid search), `best()`.
+
+### Flujo de datos
+
+- Entrada: configuración base y espacios de parámetros; métricas objetivo definidas por `T_mean` y `P_mean` en el rango [rpm_min, rpm_max].
+- Proceso: cada candidato `p` modifica el setup (geometría, levas, calibración), ejecuta `core.cycle.run_rpm_sweep` en la malla del rango y calcula `J = w_T*T_mean + w_P*P_mean`; métodos de búsqueda controlan la exploración del espacio.
+- Salida: configuración óptima p*, top N y comparación con base; resultados preparados para `io.results` y para alimentar pipelines de validación.
+
+## core.validation
+
+### Tipos de tests
+
+- **Unitarios numéricos**: conservación de masa/energía en `core.gasdynamics` para conductos simples; validación de `ThermoSolver` en procesos adiabáticos/isotermos; cálculo de volumen y cinemática en `core.engine`.
+- **Regresión**: comparación de salidas completas (curvas rpm–par–potencia, trazas de presión) contra archivos de referencia; umbrales de tolerancia configurables.
+- **Coherencia física**: checks automáticos de tendencias (p.ej., aumentar VE en 5% debe aumentar par en banda objetivo dentro de rango esperado; adelantos de levas modifican VE en la dirección correcta).
+
+### Integración y flujo
+
+- Integración con `pytest` u otro runner para ejecutar suites; fixtures que cargan configuraciones base desde `io.config` y resultados de referencia desde `io.results`.
+- Casos base: cilindro único atmosférico sin onda (validación 0D), conducto recto con onda reflejada (validación 1D), ciclo completo con levas básicas.
+- Resultados de validación se almacenan vía `io.results` para trazabilidad; los checks se usan en CI para detectar regresiones al modificar modelos numéricos.
