@@ -132,6 +132,7 @@ Este documento describe la arquitectura completa del simulador 0D/1D de motores 
   - Métodos públicos: `torque_from_imep(imep, displacement, mechanical_loss_model)`, `power_from_torque(torque, rpm)`, `aggregate_cycle_results(cycle_data) → {torque_curve, power_curve, ve_curve, imep_per_cyl, bmep_per_cyl}`.
   - Inputs: resultados discretos por ángulo/ciclo de `EngineSimulator`.
   - Outputs: curvas listadas y listas por cilindro que se entregan a `io.results` o contenedores de resultados.
+- `mechanical_loss_model`: función u objeto con método `loss_torque(rpm, imep, engine) → torque_pérdidas_promedio` usado para convertir IMEP en BMEP/torque efectivo.
 
 ### Relaciones
 
@@ -167,6 +168,12 @@ Este documento describe la arquitectura completa del simulador 0D/1D de motores 
 - `load_config(path) → raw_config`.
 - `validate_config(raw_config) → validated_config` (chequea tipos, rangos, presencia de secciones requeridas).
 - `build_engine(validated_config) → Engine`, `build_valvetrain(validated_config) → ValvetrainAssembly`, `build_thermo_models(validated_config) → {CombustionModel, EmpiricalFillModel}`, `build_gas_network(validated_config) → GasNetworkConfig`, `build_simulation_setup(validated_config) → SimulationSetup` (contiene referencias a todos los objetos y opciones de simulación).
+
+### SimulationSetup
+
+- Estructura compuesta que agrupa todo lo necesario para lanzar una simulación.
+- Atributos: `engine` (`Engine`), `valvetrain` (`ValvetrainAssembly`), `gas_network_config` (`GasNetworkConfig` o `None` en modo 0D), `combustion_models` (mapa `cylinder_id → CombustionModel`), `fill_model` (`EmpiricalFillModel` o `None` si no se usa modo rápido), `operation` (rpm fija o `rpm_schedule`, condiciones ambientales, rango de rpm para sweeps), `simulation_options` (p. ej. `delta_theta`, flags de `fast_mode`/`detailed_mode`, CFL, número máximo de ciclos), `acoustics_options` (frecuencia de muestreo, normalización), `output_options` (rutas, qué artefactos guardar).
+- Métodos públicos: `to_dict()`, `from_dict()`, `summary()`.
 
 ### Relaciones
 
@@ -253,6 +260,7 @@ Este documento describe la arquitectura completa del simulador 0D/1D de motores 
 - `generate_exhaust_sound(sim_result, audio_settings) → AudioBundle`
   - Entrada: `SimulationResult` que incluya presión en cola de escape; ajustes de muestreo/normalización.
   - Salida: señal de audio remuestreada, espectro y metadatos listos para exportar.
+  - `audio_settings`: dict/struct mínimo con `sampling_rate`, `normalization_mode` y opciones básicas de filtro (p. ej. pasa-altas/pasa-bajas opcionales).
 
 - `run_exploration(config_obj, exploration_settings) → ExplorationResult`
   - Entrada: setup base más definición de parámetros a barrer y muestreo.
