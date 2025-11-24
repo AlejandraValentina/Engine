@@ -1,13 +1,14 @@
-# Arquitectura detallada de módulos clave
+# Arquitectura detallada del simulador 0D/1D de motores ICE
 
-Este documento define la arquitectura interna propuesta para los módulos `core.engine`, `core.thermo` y `core.valvetrain` del simulador 0D/1D de motores de combustión de altas rpm. Se describen clases, atributos principales, métodos públicos y relaciones con otros módulos.
+Este documento describe la arquitectura completa del simulador 0D/1D de motores de combustión interna de altas rpm. Incluye la estructura de paquetes, clases, atributos y métodos públicos esperados para `core.engine`, `core.thermo`, `core.valvetrain`, `core.gasdynamics`, `core.cycle`, `core.acoustics`, `core.performance`, `core.exploration`, `core.optimization`, `core.validation`, así como los módulos de entrada/salida `io.config`, `io.results`, `io.audio` y las capas de interfaz `app.cli` y `app.api`. Sirve como fuente de verdad para la implementación sin introducir módulos o tipos no definidos.
 
 ## core.engine
 
 ### Clases principales
 
 - **Engine**
-  - Atributos: `n_cylinders`, `layout` (L/V/flat), `v_angle`, `firing_order` (lista de índices de cilindro), `rpm_schedule` (valor instantáneo o mapa), `banks` (lista de `Bank`), `shared_intake_manifold`, `shared_exhaust_manifold`, parámetros globales de operación (modo rápido/detallado, referencia de sincronización).
+  - Atributos: `n_cylinders`, `layout` (L/V/flat), `v_angle`, `firing_order` (lista de índices de cilindro), `rpm_schedule`, `banks` (lista de `Bank`), `shared_intake_manifold`, `shared_exhaust_manifold`, parámetros globales de operación (modo rápido/detallado, referencia de sincronización).
+  - Formato de `rpm_schedule`: admite `float` para rpm fija o lista de objetos `{rpm: float, duration_deg: float}` indicando rpm objetivo y la duración en grados de cigüeñal antes de cambiar al siguiente punto.
   - Métodos públicos: `from_config(config_dict)`, `build_standard(layout, displacement, n_cylinders, v_angle=None, stroke_to_bore=None)`, `get_cylinder(cid)`, `get_bank(bid)`, `volume_at(crank_angle, cid)`, `volume_derivative(crank_angle, cid)`, `piston_kinematics(crank_angle, cid)` (posición/velocidad/aceleración), `firing_angle(cid)` (ángulo absoluto de referencia), `synchronize_with(valvetrain)` (valida offset de levas) y helpers para iterar cilindros en orden de encendido.
 
 - **Bank**
@@ -15,12 +16,12 @@ Este documento define la arquitectura interna propuesta para los módulos `core.
   - Métodos públicos: `add_cylinder(cylinder)`, `get_cylinders()`, `relative_firing_sequence()`.
 
 - **Cylinder**
-  - Atributos: `cylinder_id`, `bore`, `stroke`, `rod_length`, `compression_ratio`, `deck_clearance`, `wrist_pin_offset`, `crank_offset` (fase de referencia), `bank_id`, `clearance_volume`, parámetros geométricos derivados (área de pistón, desplazamiento unitario).
+  - Atributos: `cylinder_id`, `bore`, `stroke`, `rod_length`, `compression_ratio`, `deck_clearance`, `wrist_pin_offset`, `crank_offset` (fase de referencia), `bank_id`, parámetros geométricos derivados (área de pistón, desplazamiento unitario). `clearance_volume` no se almacena: se deriva siempre a partir de `compression_ratio` y cilindrada para evitar inconsistencias.
   - Métodos públicos: `instant_volume(crank_angle)`, `instant_volume_derivative(crank_angle)`, `piston_state(crank_angle)` (posición/velocidad/aceleración), `top_dead_center_angle()`, `bottom_dead_center_angle()`.
 
 ### Relaciones y uso por otros módulos
 
-- `core.cycle` consulta a `Engine`/`Cylinder` para obtener volumen instantáneo y cinemática al avanzar el estado termodinámico por ángulo de cigüeñal.
+- `core.cycle` consulta a `Engine`/`Cylinder` para volumen instantáneo y cinemática al avanzar el estado termodinámico por ángulo de cigüeñal.
 - `core.valvetrain` se sincroniza mediante `engine.firing_angle` y los offsets de banco para alinear eventos de apertura/cierre con cada cilindro.
 - `core.gasdynamics` consume datos de disposición (bancos, colectores, orden de encendido) para asignar condiciones de contorno 1D y la topología de conductos.
 - `io.config` construye instancias vía `Engine.from_config` usando parámetros de JSON/YAML; `core.exploration` y `core.optimization` pueden generar variantes llamando a `build_standard` con diferentes dimensiones.
@@ -31,20 +32,26 @@ Este documento define la arquitectura interna propuesta para los módulos `core.
 
 - **CylinderState**
   - Atributos: `pressure`, `temperature`, `mass`, `burn_fraction`, `fuel_mass`, `equivalence_ratio`, `gamma_effective`, `cp`, `cv`, `exhaust_residual_fraction`, indicadores de modo (`fast_fill_model` vs `coupled_1d`).
+  - Política de propiedades: `gamma_effective`, `cp` y `cv` se recalculan mediante `update_properties(thermo_table)` siempre que cambie `pressure`, `temperature` o la composición; no se consideran constantes almacenadas salvo para registrar el último valor usado.
   - Métodos públicos: `clone()`, `update_properties(thermo_table)`, `reset_burn()`, acceso a propiedades derivadas (densidad, energía interna específica).
 
 - **CombustionModel** (por ejemplo, Wiebe parametrizable)
   - Atributos: `theta_start`, `duration`, `m_shape`, `n_shape`, `mass_fraction_burned_curve` (opcional pretabulada), `heat_release_lhv`, correcciones por rpm/carga.
-  - Métodos públicos: `mass_fraction_burned(crank_angle)`, `heat_release_rate(crank_angle)`, `configure(params_dict)`, `shift(theta_offset)`, `scale_duration(factor)` para estrategias de optimización.
+  - Métodos públicos: `mass_fraction_burned(crank_angle)`, `heat_release_rate(crank_angle)`, `configure(params_dict)`, `shift(theta_offset)`, `scale_duration(factor)`.
 
 - **ThermoSolver**
   - Atributos: referencias a `Cylinder`, `CylinderState`, `CombustionModel`, parámetros del modo de cálculo (`fast_mode`, `detailed_mode`, resolución de ángulo), modelos de pérdidas mecánicas (para BMEP), banderas de acoplamiento 1D.
   - Métodos públicos: `step(crank_angle, delta_theta, mass_in, mass_out, enthalpy_in, enthalpy_out)` (actualiza estado 0D), `compute_pressure_trace(crank_window)`, `indicated_work()`, `imep()`, `bmep(mechanical_loss_model)`, `set_boundary_conditions(...)`, `enable_fast_fill(empirical_model)`.
+  - Convenciones de `step`: `mass_in` y `mass_out` representan la masa total intercambiada durante el paso de ángulo `delta_theta` (integral de caudal másico sobre el paso); `enthalpy_in` y `enthalpy_out` son las entalpías asociadas a esas masas (masa × entalpía específica promedio en el paso).
+
+- **EmpiricalFillModel** (interfaz mínima para modo rápido)
+  - Responsabilidad: dado rpm y parámetros de estado, devolver masa fresca por ciclo o VE estimada.
+  - API esperada: `estimate_mass_flow(rpm, cylinder, valvetrain_state, ambient_conditions) → {mass_in_cycle, residual_fraction}`.
 
 ### Relaciones y flujo de información
 
 - `ThermoSolver` requiere geometría de `core.engine.Cylinder` para volumen/derivada en cada paso y usa la alzada/área efectiva de válvulas de `core.valvetrain` (vía `core.cycle`) para estimar masas entrantes/salientes.
-- En modo rápido, `ThermoSolver` consume modelos empíricos de llenado proporcionados por `core.performance` o `core.exploration` para estimar `mass_in/mass_out` sin resolver 1D.
+- En modo rápido, `ThermoSolver` consume modelos empíricos de llenado (`EmpiricalFillModel`) para estimar `mass_in/mass_out` sin resolver 1D.
 - En modo detallado, las condiciones de contorno y caudales provienen de `core.gasdynamics`, mientras que los resultados de presión/temperatura se devuelven a `core.gasdynamics` y `core.acoustics`.
 - Configuración: parámetros de `CombustionModel` y estados iniciales se cargan desde JSON/YAML a través de `io.config` y se asignan a cada cilindro.
 
@@ -57,7 +64,7 @@ Este documento define la arquitectura interna propuesta para los módulos `core.
   - Métodos públicos: `lift_at(crank_angle)`, `derivative_at(crank_angle)`, `curtain_area(valve_diameter, crank_angle)`, `apply_advance(delta_deg)`, `apply_duration_scale(factor)`, `to_dict()`/`from_dict()` para import/export, `resample(resolution_deg)`.
 
 - **Valve**
-  - Atributos: `valve_id`, `type` (intake/exhaust), `diameter`, `seat_angle`, `cam_profile` (referencia a `CamProfile`), `stem_length`, `clearance`, `flow_coefficient_map` (opcional), restricciones de movimiento (VVL/VVT).
+  - Atributos: `valve_id`, `type` (intake/exhaust), `diameter`, `seat_angle`, `cam_profile` (referencia a `CamProfile`), `stem_length`, `clearance`, `flow_coefficient_map` (tabla `lift → C_d` con interpolación lineal o spline), restricciones de movimiento (VVL/VVT).
   - Métodos públicos: `lift(crank_angle)`, `effective_area(crank_angle, discharge_coeff_model=None)`, `apply_global_phase(delta_deg)`, `modify_lift(factor)`.
 
 - **ValvetrainAssembly**
@@ -69,164 +76,162 @@ Este documento define la arquitectura interna propuesta para los módulos `core.
 - `core.cycle` consulta `ValvetrainAssembly` para obtener alzadas y áreas efectivas en cada ángulo al calcular `mass_in/mass_out` y establecer condiciones de contorno hacia `core.gasdynamics` o modelos empíricos.
 - `core.gasdynamics` usa las áreas efectivas y coeficientes de descarga como entrada a condiciones de contorno 1D (válvulas como conectores entre cilindro y conductos).
 - `core.engine` sincroniza ángulos de referencia de cilindros con `ValvetrainAssembly` para considerar offsets de banco y orden de encendido en la evaluación de perfiles.
-- `core.exploration` y `core.optimization` ajustan globalmente `cam_advance_intake/ exhaust`, duración y alzada via métodos de `CamProfile`/`Valve` para estudios paramétricos.
-
-## Interacción general entre módulos
-
-1. `io.config` crea `Engine`, `ValvetrainAssembly`, `CombustionModel` y estados iniciales (`CylinderState`) desde JSON/YAML.
-2. `core.cycle` itera ángulos: consulta `Engine` para volumen/derivadas, `ValvetrainAssembly` para áreas de válvula y `ThermoSolver` para avanzar el estado; intercambia caudales con `core.gasdynamics` en modo detallado.
-3. `core.performance` integra los resultados de `ThermoSolver` (IMEP/BMEP) con rpm de `Engine` para curvas de par/potencia; `core.acoustics` usa presiones de escape si está acoplado.
-4. `core.exploration`/`core.optimization` parametrizan geometrías y levas usando las APIs públicas para generar variantes y ejecutar pipelines de simulación.
+- `core.exploration` y `core.optimization` ajustan globalmente `cam_advance_intake/ cam_advance_exhaust`, duración y alzada vía métodos de `CamProfile`/`Valve` para estudios paramétricos.
 
 ## core.gasdynamics
 
-### Clases y estructuras
+### Entidades geométricas y de red
 
-- **Pipe**
-  - Atributos: `length`, `inner_diameter`, `roughness`, `n_segments`, `wall_temperature`, `material`, discretización interna (`segments`: lista de `Segment`).
-  - Métodos públicos: `discretize()`, `segment_at(index)`, `friction_factor(reynolds_number)`, `characteristic_impedance()`.
-
-- **Segment/Cell**
-  - Atributos: `pressure`, `temperature`, `density`, `velocity`, `mass_flux`, `enthalpy`, `position`, `area`, `time_step_local` (para CFL), `gamma_effective`, `speed_of_sound`.
-  - Métodos públicos: `state_vector()`, `update_state(new_values)`, `compute_time_step(cfl_number)`, `as_boundary_conditions()`.
-
-- **Junction**
-  - Atributos: `junction_id`, `connected_pipes` (lista de referencias a `Pipe` + posición), `loss_coefficients`, `volume` (si aplica), `mixing_temperature_model`.
-  - Métodos públicos: `apply_mass_energy_balance()`, `compute_reflections()`, `set_boundary_conditions()`.
-
-- **Plenum**
-  - Atributos: `plenum_id`, `volume`, `pressure`, `temperature`, `mass`, `gamma_effective`, `inlet_outlet_connections` (a `Pipe`/`Junction`), coeficientes de pérdida.
-  - Métodos públicos: `update(mean_mass_flow, mean_enthalpy, dt)`, `as_boundary_conditions()`, `reset(initial_state)`.
-
-- **GasNetwork**
-  - Atributos: `pipes`, `junctions`, `plenums`, `boundary_nodes` (atmósfera, válvulas), `coupling_map` (cilindro ↔ nodo), parámetros numéricos (`cfl`, `scheme`, `time_base`: tiempo real o ángulo), historial de señales.
-  - Métodos públicos: `from_config(network_config)`, `initialize_network()`, `step(delta_t, cylinder_boundaries, valve_areas)`, `pressure_history(node_id)`, `mass_flow_history(node_id)`, `export_state()`.
+- **Pipe**: longitud, diámetro interno, rugosidad, número de segmentos, material/temperatura de pared simplificada.
+- **Segment/Cell**: variables de estado (`pressure`, `temperature`, `density`, `velocity`, composición simple), posición axial, referencias a celdas vecinas.
+- **Junction**: unión T/Y con continuidad de masa/energía, coeficientes de pérdida local.
+- **Plenum**: volumen, presión y temperatura medias, intercambio de calor simplificado.
+- **GasNetwork**: grafo de nodos (plenos, uniones, cilindros) y aristas (conductos); mantiene conectividad con cilindros y salida a atmósfera.
+- **GasNetworkConfig**: representación construida desde `io.config` que incluye lista de conductos (con sus extremos), plenos, uniones y condiciones de contorno asociadas a cilindros y a la atmósfera.
 
 ### Dinámica y esquema numérico
 
-- Esquema: variantes explícitas de características o Lax-Wendroff 1D para gases ideales con correcciones de pérdidas (Fanno/isentropic); `compute_time_step` por CFL en cada `Segment`.
-- Integración: `GasNetwork.step` avanza todas las celdas usando el paso global (mínimo de CFL) o un paso controlado por avance de ángulo; actualiza variables conservadas y aplica fuentes por fricción y transferencia de calor simplificada.
-- Condiciones de contorno: en válvulas, intercambio de masa/energía con `core.thermo` via caudal choked/subsonic basado en `valve_areas` (de `core.valvetrain`); en plenos, balance 0D de masa/energía; salida a atmósfera mediante condición de presión fija y coeficiente de reflexión configurable.
+- Esquema 1D explícito o semi-implícito basado en características simplificadas; control de paso por condición CFL (`dt ≤ CFL * dx / a`).
+- `GasNetwork.step(time_step, engine_state, valve_states)`: avanza todas las celdas; actualiza variables por segmento, resuelve uniones/plenos y aplica condiciones de contorno.
+- Condiciones de contorno: en válvulas (caudal según área efectiva y salto de presión), en plenos (balance de masa/energía), en salida (presión fija con coeficiente de reflexión ajustable).
+- Consultas de salida: `pressure_history_at(node_id)`, `massflow_history_at(node_id)`, `export_signals()` para acústica.
 
-### Flujo de datos
+### Relaciones
 
-- Entradas: geometría de conductos/plenos desde `io.config`, áreas de válvula desde `core.valvetrain`, presiones/temperaturas de cilindro desde `core.thermo` (a través de `core.cycle`).
-- Salidas: caudales y presiones en nodos de válvula devueltos a `core.cycle` para actualizar estados 0D; historial de presión en cola de escape para `core.acoustics` y curvas de VE/pérdidas para `core.performance`.
+- Recibe geometría y acoplamiento cilindro–válvula desde `core.engine` y `core.valvetrain` vía `GasNetworkConfig`.
+- Interactúa con `core.thermo.ThermoSolver` intercambiando masa/entalpía en cada paso de ángulo/tiempo.
+- Proporciona señales de presión/caudal a `core.acoustics` y métricas a `io.results`.
 
 ## core.cycle
 
-### Clase principal
+### Clase principal: EngineSimulator (o CycleRunner)
 
-- **EngineSimulator** (o `CycleRunner`)
-  - Atributos: referencias a `Engine`, `ValvetrainAssembly`, `ThermoSolver` por cilindro, `GasNetwork`, configuraciones de modo (`fast_mode`, `detailed_mode`), malla de ángulo (`delta_theta`), estado de rpm actual, buffers de resultados (presión por cilindro, par instantáneo, VE), tolerancias de convergencia.
-  - Métodos públicos:
-    - `run_steady_state(rpm)`: itera ciclos completos hasta estado cuasi estacionario, devuelve métricas agregadas (torque medio, potencia, IMEP/BMEP por cilindro y global, VE).
-    - `run_rpm_sweep(rpm_grid)`: ejecuta `run_steady_state` en una malla de rpm y agrega curvas rpm–par–potencia–VE.
-    - `step_cycle(delta_theta=None)`: avanza un paso de ángulo sobre todos los cilindros; coordina llamadas a `ValvetrainAssembly` para áreas de válvula, a `ThermoSolver.step` por cilindro y a `GasNetwork.step` cuando está acoplado.
-    - `compute_instantaneous_torque(crank_angle)`: suma contribuciones indicadas de cada cilindro y pérdidas mecánicas.
-    - `export_results()`: retorna estructura con trazas de presión, par, VE y estados de la red.
+- Atributos: referencias a `Engine`, `ValvetrainAssembly`, `ThermoSolver`/`CombustionModel` por cilindro, `GasNetwork` (opcional), configuración de paso angular `delta_theta`, banderas de modo (`fast_mode` vs `detailed_mode`).
+- Métodos públicos: `run_steady_state(rpm)`, `run_rpm_sweep(rpm_grid)`, `step_once()` (avanza un paso de ángulo), `get_instant_torque()`, `collect_metrics()`.
+- Modos: modo rápido desacoplado de `core.gasdynamics` usando `EmpiricalFillModel`; modo detallado acoplado con `GasNetwork`.
 
-### Modos de operación
+### Salidas principales
 
-- Modo rápido: `EngineSimulator` desactiva `GasNetwork`, usa modelos empíricos de llenado en `ThermoSolver` y áreas de válvula para estimar caudales; útil para barridos masivos.
-- Modo detallado: acopla `ThermoSolver` con `GasNetwork` en cada paso; usa rpm fija o variable según `rpm_schedule`; permite extraer señales transitorias para `core.acoustics`.
+- Par instantáneo por cilindro y total, IMEP/BMEP por cilindro y global, VE por cilindro y global.
+- Trazas de presión vs ángulo, caudales en válvulas, señales de red 1D para acústica.
 
-### Flujo de datos
+### Relaciones
 
-- Entrada: objetos de `io.config` (motor, levas, red, combustión, opciones de simulación), rpm objetivo o malla de rpm.
-- Interacción: por ángulo, consulta geometría a `Engine`, alzadas/áreas a `ValvetrainAssembly`, actualiza estados 0D con `ThermoSolver`, intercambia condiciones de contorno con `GasNetwork` si procede.
-- Salida: métricas de rendimiento para `io.results` y `core.performance`, trazas de presión/caudal para `core.acoustics`, datos de VE y caudales para validación.
+- Orquesta el avance sincronizado de `ThermoSolver` y `GasNetwork` usando geometría de `Engine` y perfiles de `ValvetrainAssembly`.
+- Alimenta a `core.performance` para integración de par/potencia y a `core.acoustics` para síntesis de sonido.
 
-## core.acoustics
-
-### Componentes principales
-
-- **AcousticPostProcessor**
-  - Atributos: `sampling_rate`, `rpm_reference`, `windowing_options`, `normalization_mode`, `filter_options` (HP/LP/BP), `spectrum_config` (tamaño de FFT, promedio), historial de señales recibidas.
-  - Métodos públicos:
-    - `angle_to_time(pressure_trace, rpm)`: convierte trazas vs ángulo a vs tiempo.
-    - `resample_to_audio(signal, target_fs)`: remuestrea y filtra para generar señal audible.
-    - `normalize(signal)`: ajusta amplitud evitando clipping (opcionalmente con headroom configurable).
-    - `generate_exhaust_sound(simulation_result)`: pipeline completo que toma presión en cola de escape (de `core.gasdynamics` o modelo simplificado), convierte a audio y devuelve serie temporal.
-    - `compute_spectrum(signal)`: calcula FFT y devuelve magnitud/frecuencia con metadatos.
-    - `export_audio(signal, path)`: delega en `io.audio` para escribir `.wav` con metadatos de rpm y condiciones.
-    - `export_spectrum(spectrum, path)`: serializa espectros en CSV/JSON vía `io.results`.
-
-### Flujo de datos
-
-- Entradas: historial de presión en la cola de escape de `GasNetwork` o señales generadas por modelos rápidos; rpm actual desde `core.cycle` para la conversión ángulo-tiempo.
-- Salidas: serie de audio y espectros para análisis o reproducción; datos pasan a `io.audio`/`io.results` y gráficos opcionales.
-
-## io.config
+## core.performance
 
 ### Responsabilidad
 
-- Leer configuraciones JSON/YAML, validar estructura y construir objetos de dominio (`Engine`, `ValvetrainAssembly`, `GasNetworkConfig`, `CombustionModel`, opciones de simulación).
+- Integrar salidas de `core.cycle` (IMEP/BMEP instantáneos y par indicado) con rpm para obtener curvas de par y potencia, así como VE y BSFC si se dispone de consumo.
 
-### Clases y funciones
+### Entidades y métodos
 
-- **ConfigSchema**
-  - Atributos: definiciones de campos esperados para secciones `engine`, `valvetrain`, `gasdynamics`, `thermo/combustion`, `operation` (rpm, modos), `simulation_options` (resolución angular, modo rápido/detallado), `acoustics`.
-  - Métodos públicos: `validate(raw_config)`, `default_values()`, `schema_version()`.
+- **PerformanceAggregator**
+  - Métodos públicos: `torque_from_imep(imep, displacement, mechanical_loss_model)`, `power_from_torque(torque, rpm)`, `aggregate_cycle_results(cycle_data) → {torque_curve, power_curve, ve_curve, imep_per_cyl, bmep_per_cyl}`.
+  - Inputs: resultados discretos por ángulo/ciclo de `EngineSimulator`.
+  - Outputs: curvas listadas y listas por cilindro que se entregan a `io.results` o contenedores de resultados.
 
-- **ConfigLoader**
-  - Métodos públicos: `load_config(path)`, `validate_config(raw_config)`, `build_engine(config)`, `build_valvetrain(config)`, `build_gas_network(config)`, `build_thermo_models(config)`, `build_acoustics(config)`, `build_simulation_options(config)`.
-  - Salida: estructura compuesta (por ejemplo `SimulationSetup`) con instancias listas para `core.cycle`.
+### Relaciones
 
-- **SimulationSetup**
-  - Atributos: instancias configuradas de `Engine`, `ValvetrainAssembly`, `GasNetwork` (o su configuración para inicializar), `ThermoSolver`/`CombustionModel`, opciones de operación (rpm, grid), flags de modos, rutas de salida.
-  - Métodos públicos: `to_dict()`, `from_dict()`, `summary()`.
+- Consumido por `core.cycle` y `app.api` para generar `SimulationResult` y `SweepResult` listos para serialización.
+- Reutilizado por `core.exploration` y `core.optimization` para evaluar métricas T_mean y P_mean.
 
-### Flujo de datos
+## core.acoustics
 
-- Entrada: archivo JSON/YAML del usuario.
-- Proceso: `ConfigLoader.load_config` parsea y valida con `ConfigSchema`; construye objetos o diccionarios de parámetros para inicializar módulos `core.*`.
-- Salida: `SimulationSetup` se pasa a `core.cycle.EngineSimulator` y a cualquier orquestador CLI/API.
+### Funciones principales
+
+- Convertir señales de presión vs ángulo a dominio temporal según rpm, remuestrear a frecuencia de audio (p.ej., 44.1 kHz), normalizar amplitud y evitar clipping.
+- Calcular espectros vía FFT y generar datos listos para graficar.
+
+### APIs
+
+- `generate_exhaust_sound(simulation_result, audio_settings)`: produce señal de audio y metadatos a partir de la presión en cola de escape.
+- `compute_spectrum(pressure_signal, sampling_rate)`: devuelve magnitud vs frecuencia.
+- Salidas preparadas para `io.audio` y `io.results`.
+
+### Relaciones
+
+- Consume señales de `core.gasdynamics` o de modelos simplificados entregados por `core.cycle`.
+- Devuelve series temporales y espectros para exportación o análisis.
+
+## io.config
+
+### Estructura esperada de configuración (JSON/YAML)
+
+- Secciones: `engine`, `valvetrain`, `gasdynamics`, `combustion/thermo`, `operation` (rpm o `rpm_schedule`, condiciones ambientales), `simulation` (paso angular, modo rápido/detallado), `acoustics` (opciones de audio), `exploration`, `optimization`.
+
+### Funciones públicas
+
+- `load_config(path) → raw_config`.
+- `validate_config(raw_config) → validated_config` (chequea tipos, rangos, presencia de secciones requeridas).
+- `build_engine(validated_config) → Engine`, `build_valvetrain(validated_config) → ValvetrainAssembly`, `build_thermo_models(validated_config) → {CombustionModel, EmpiricalFillModel}`, `build_gas_network(validated_config) → GasNetworkConfig`, `build_simulation_setup(validated_config) → SimulationSetup` (contiene referencias a todos los objetos y opciones de simulación).
+
+### Relaciones
+
+- Fuente única de creación de objetos de dominio para `app.cli` y `app.api`.
+- Provee `GasNetworkConfig` que se transforma en instancias de `GasNetwork` en `core.gasdynamics`.
 
 ## io.results
 
-### Funciones y estructuras
+### Funciones principales
 
-- **ResultWriter**
-  - Métodos públicos: `save_rpm_curves(results, path, formats=['csv','json'])`, `save_pressure_history(signal, path)`, `save_mass_flow_history(signal, path)`, `save_spectrum(spectrum, path)`, `save_simulation_metadata(setup, path)`.
-  - Opcionales: `plot_rpm_curves(results, path=None)`, `plot_pressure_trace(signal, path=None)`, `plot_spectrum(spectrum, path=None)` usando Matplotlib.
+- `save_rpm_curves(results, path)`: guarda curvas rpm–par–potencia–VE en CSV/JSON.
+- `save_pressure_history(results, path)`: guarda señales de presión/caudal de interés.
+- `save_spectrum(spectrum, path)`: almacena espectros de audio en CSV/JSON.
+- `save_run_metadata(metadata, path)`: registra parámetros clave de la simulación.
+- Opcional: helpers de graficado con Matplotlib (`plot_rpm_curves`, `plot_pressure_traces`).
 
-- **ResultBundle**
-  - Atributos: `rpm_curves` (par, potencia, VE), `cylinder_traces` (presión vs ángulo), `network_traces` (presión/caudal en nodos), `acoustic_signals`, `spectra`, `metadata` (configuración, versión de modelo, fecha).
-  - Métodos públicos: `merge(other_bundle)`, `filter_by_rpm(rpm_range)`, `to_dict()`.
+### Relaciones
 
-### Flujo de datos
+- Consume contenedores `SimulationResult`, `SweepResult`, `AudioBundle`, `ExplorationResult`, `OptimizationResult` para serialización.
+- Usado por `app.cli` y suites de `core.validation` para generar reportes y artefactos.
 
-- Entrada: resultados agregados de `core.cycle` (curvas y trazas), señales de `core.gasdynamics` y audio/espectros de `core.acoustics`.
-- Salida: archivos CSV/JSON y gráficos opcionales; provee insumos para `core.validation` y para reporting por CLI/API.
+## io.audio
+
+### Responsabilidad
+
+- Convertir series temporales de presión/sonido a archivos `.wav` con normalización y metadatos básicos.
+
+### APIs
+
+- `write_wav(signal, sampling_rate, path, metadata=None)`: exporta audio.
+- `normalize_signal(signal, target_level)`: ajusta amplitud evitando clipping.
+- `attach_metadata(signal, metadata_dict)`: almacena información de origen (rpm, modo, fecha, configuración) junto al archivo.
+
+### Relaciones
+
+- Consumido por `core.acoustics` y `app.cli` (`sound` command) para persistir audio.
+- Puede ser invocado desde `io.results` como helper al guardar `AudioBundle`.
 
 ## app.cli
 
-### Comandos conceptuales y parámetros clave
+### Comandos conceptuales
 
 - **sim-0d**
-  - Parámetros: `--config path` (JSON/YAML), `--rpm value` o `--rpm-map path`, `--output dir`, `--angle-step deg`, `--fast-fill-model name`.
-  - Resultados: archivos CSV/JSON con par/potencia/VE/IMEP/BMEP, metadatos de simulación; opcionalmente gráficas y trazas de presión por cilindro.
+  - Parámetros: `--config path`, `--rpm value|schedule`, `--output dir`.
+  - Resultado: `SimulationResult` en modo rápido (0D) y archivos CSV/JSON vía `io.results`.
 
 - **sim-1d**
-  - Parámetros: `--config path`, `--rpm value|map`, `--output dir`, `--cfl-safety factor`, `--angle-step deg`, `--max-cycles n`.
-  - Resultados: mismos que `sim-0d` pero incluyendo trazas de red 1D (presión/caudal en nodos), historial de convergencia y datos para acústica.
+  - Parámetros: `--config path`, `--rpm value|schedule`, `--output dir`.
+  - Resultado: `SimulationResult` en modo detallado (0D+1D) con señales de red.
 
 - **rpm-sweep**
   - Parámetros: `--config path`, `--rpm-grid start:end:step` o lista, `--mode 0d|1d`, `--output dir`.
-  - Resultados: curvas rpm–par–potencia–VE en CSV/JSON; gráficos opcionales.
+  - Resultado: `SweepResult` con curvas rpm–par–potencia–VE; gráficos opcionales.
 
 - **sound**
   - Parámetros: `--config path`, `--rpm value`, `--mode 0d|1d`, `--audio-fs hz`, `--output dir`.
-  - Resultados: archivo `.wav` y espectro en CSV/JSON generados desde la señal de escape.
+  - Resultado: archivo `.wav` y espectro en CSV/JSON generados desde la señal de escape.
 
 - **explore**
   - Parámetros: `--config path`, `--exploration-config path`, `--mode 0d|1d`, `--rpm value|grid`, `--output dir`, `--max-samples n`.
-  - Resultados: tabla de combinaciones exploradas con métricas clave; mejores configuraciones exportables.
+  - Resultado: `ExplorationResult` con tabla de combinaciones y métricas; exportable vía `io.results`.
 
 - **optimize**
   - Parámetros: `--config path`, `--optimization-config path`, `--rpm-range min max`, `--mode 0d|1d`, `--output dir`, `--method grid|random|hill`.
-  - Resultados: configuración óptima y top N, curvas comparativas vs configuración base, tabla con T_mean, P_mean y objetivo J.
+  - Resultado: `OptimizationResult` con configuración óptima y top N, curvas comparativas vs configuración base.
 
 ### Relaciones
 
@@ -239,7 +244,7 @@ Este documento define la arquitectura interna propuesta para los módulos `core.
 
 - `run_simulation(config_obj, mode="0d"|"1d", rpm=value|schedule) → SimulationResult`
   - Entrada: estructura de configuración validada (`SimulationSetup`), selección de modo y rpm o mapa de rpm.
-  - Salida: objeto `SimulationResult` con par/potencia/VE/IMEP/BMEP, trazas por cilindro y de red según el modo.
+  - Salida: `SimulationResult` con par/potencia/VE/IMEP/BMEP, trazas por cilindro y de red según el modo.
 
 - `run_rpm_sweep(config_obj, rpm_grid, mode="0d"|"1d") → SweepResult`
   - Entrada: setup más malla de rpm.
@@ -259,8 +264,8 @@ Este documento define la arquitectura interna propuesta para los módulos `core.
 
 ### Relaciones
 
-- Las funciones instancian `core.cycle.EngineSimulator` con objetos de `io.config`, delegan en `core.exploration` o `core.optimization` cuando aplica, y usan `core.acoustics` para sonido.
-- `SimulationResult`, `SweepResult`, `ExplorationResult` y `OptimizationResult` son contenedores serializables que `io.results` puede escribir.
+- Las funciones instancian `core.cycle.EngineSimulator` con objetos de `io.config`, delegan en `core.exploration` o `core.optimization` cuando aplica, y usan `core.acoustics`/`core.performance` para sonido y métricas.
+- `SimulationResult`, `SweepResult`, `ExplorationResult`, `OptimizationResult` y `AudioBundle` son contenedores serializables que `io.results` y `io.audio` pueden escribir.
 
 ## core.exploration
 
@@ -313,3 +318,29 @@ Este documento define la arquitectura interna propuesta para los módulos `core.
 - Integración con `pytest` u otro runner para ejecutar suites; fixtures que cargan configuraciones base desde `io.config` y resultados de referencia desde `io.results`.
 - Casos base: cilindro único atmosférico sin onda (validación 0D), conducto recto con onda reflejada (validación 1D), ciclo completo con levas básicas.
 - Resultados de validación se almacenan vía `io.results` para trazabilidad; los checks se usan en CI para detectar regresiones al modificar modelos numéricos.
+
+## Tipos de resultados de alto nivel
+
+### ResultBundle (base genérica)
+
+- Contiene campos comunes: `metadata` (config, modo, rpm/rpm_grid), `torque_curve`, `power_curve`, `ve_curve`, referencias a trazas crudas (presiones, caudales), y utilidades de serialización.
+
+### SimulationResult
+
+- Especialización para una rpm o `rpm_schedule`; incluye `torque`, `power`, `imep_per_cyl`, `bmep_per_cyl`, `pressure_traces`, `network_signals`, `ve_per_cyl`, y puede envolver un `ResultBundle` como contenedor interno o exponer la misma interfaz.
+
+### SweepResult
+
+- Curvas discretas en malla de rpm: `torque_curve`, `power_curve`, `ve_curve`, `imep_map`, `bmep_map`, `points_metadata`; puede componerse de múltiples `SimulationResult` y exponer la interfaz de `ResultBundle`.
+
+### AudioBundle
+
+- Señal temporal de audio, `sampling_rate`, espectro (`freq`, `magnitude`), metadatos (rpm, modo, origen de señal). Pensado para ser serializable por `io.audio`/`io.results`.
+
+### ExplorationResult
+
+- Tabla de combinaciones evaluadas con columnas de parámetros y métricas agregadas (`T_mean`, `P_mean`, `VE_mean`, objetivo J si aplica); incluye `top_n` ordenado y referencia al setup base. Serializa vía `io.results` y mantiene compatibilidad con `ResultBundle` para compartir metadatos.
+
+### OptimizationResult
+
+- Configuración óptima `p*`, métricas (`T_mean`, `P_mean`, `J`), comparativa con la configuración base (mejora porcentual), lista de las N mejores configuraciones, y opcionalmente el historial de búsqueda. Puede envolver internamente un `ExplorationResult` si el método incluye fase exploratoria.
