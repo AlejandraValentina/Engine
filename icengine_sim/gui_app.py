@@ -12,11 +12,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from .core.cycle import EngineSimulator
-from .core.engine import Engine
-from .core.performance import PerformanceAggregator
-from .core.thermo import CombustionModel, CylinderState, EmpiricalFillModel, ThermoSolver
-from .core.valvetrain import CamProfile, Valve, ValvetrainAssembly
+from icengine_sim.core.cycle import EngineSimulator
+from icengine_sim.core.engine import Engine
+from icengine_sim.core.performance import PerformanceAggregator
+from icengine_sim.core.thermo import CombustionModel, CylinderState, EmpiricalFillModel, ThermoSolver
+from icengine_sim.core.valvetrain import CamProfile, Valve, ValvetrainAssembly
 
 
 AMBIENT_PRESSURE = 101_325.0
